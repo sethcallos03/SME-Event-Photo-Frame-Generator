@@ -1,150 +1,130 @@
-import io
-import hashlib
+"""SME Event Photo Frame Generator, optimized for big event photo sets."""
 import os
-import re
-import zipfile
-
+import tempfile
 import streamlit as st
-from PIL import Image, ImageOps, UnidentifiedImageError
+from processor import HEIC_ENABLED, frame_image, process_batch, safe_name
 
 st.set_page_config(page_title="SME Event Photo Generator", page_icon="⚙️", layout="wide")
+st.markdown("""<style>
+.stApp {background-color:#0A192F;color:#FFFFFF;}
+h1,h2,h3,h4,label {color:#FFFFFF !important;}
+div.stButton > button:first-child {background:#DCE233;color:#0D2342;font-weight:700;border:0;border-radius:8px;}
+div.stDownloadButton > button:first-child {background:#70A8D7;color:#0A192F;font-weight:700;border:0;border-radius:8px;}
+</style>""", unsafe_allow_html=True)
 
-st.markdown("""
-<style>
-.stApp { background-color: #0A192F; color: #FFFFFF; }
-h1, h2, h3, h4, label { color: #FFFFFF !important; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-div.stButton > button:first-child { background-color: #DCE233 !important; color: #0D2342 !important; font-weight: bold !important; border-radius: 8px !important; border: none !important; padding: 0.6rem 1.2rem !important; }
-div.stButton > button:first-child:hover { background-color: #E2E855 !important; }
-div.stDownloadButton > button:first-child { background-color: #70A8D7 !important; color: #0A192F !important; font-weight: bold !important; border-radius: 8px !important; }
-.stAlert { background-color: #112240 !important; border: 1px solid #70A8D7 !important; }
-</style>
-""", unsafe_allow_html=True)
+# A very large multipart upload may itself exhaust Streamlit Cloud's memory.
+# 12 high-resolution photos per upload is intentionally conservative.
+MAX_BATCH = 12
+MAX_TOTAL_MB = 180
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-logo_path = os.path.join(BASE_DIR, "sme_logo.png")
-header_col1, header_col2 = st.columns([1, 5])
-with header_col1:
-    if os.path.isfile(logo_path):
-        st.image(logo_path, width=130)
-    else:
-        st.write("⚙️ **[SME Logo]**")
-with header_col2:
+if "batch_num" not in st.session_state:
+    st.session_state.batch_num = 1
+if "export_path" not in st.session_state:
+    st.session_state.export_path = None
+if "export_meta" not in st.session_state:
+    st.session_state.export_meta = None
+
+
+def clear_prior_export():
+    path = st.session_state.export_path
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    st.session_state.export_path = None
+    st.session_state.export_meta = None
+
+
+header1, header2 = st.columns([1, 5])
+with header1:
+    logo = os.path.join(os.path.dirname(__file__), "sme_logo.png")
+    if os.path.isfile(logo):
+        st.image(logo, width=120)
+with header2:
     st.title("SME Event Photo Generator")
     st.caption("Society of Manufacturing Engineers — De La Salle University Student Chapter 200")
 st.divider()
+st.info("For 110+ large photos: upload up to 12 at a time, download the ZIP, then select **Next batch**. Files are processed one by one, not all at once.")
+if not HEIC_ENABLED:
+    st.warning("HEIC support is unavailable. Ensure pillow-heif is in requirements.txt.")
 
+left, right = st.columns([1, 2], gap="large")
+with left:
+    st.subheader(f"Batch {st.session_state.batch_num} — Upload")
+    portrait = st.file_uploader("Portrait frame (transparent PNG)", type=["png"], key="portrait_frame")
+    landscape = st.file_uploader("Landscape frame (transparent PNG)", type=["png"], key="landscape_frame")
+    photos = st.file_uploader(
+        f"Upload up to {MAX_BATCH} event photos", type=["jpg", "jpeg", "png", "heic", "heif"] if HEIC_ENABLED else ["jpg", "jpeg", "png"],
+        accept_multiple_files=True, key=f"photos_batch_{st.session_state.batch_num}"
+    )
+    prefix = st.text_input("Filename / event prefix", value="SME_Event")
+    st.caption("Output: JPG (quality 82), longest side ≤ 2200 pixels. Frame graphics are placed over your photos.")
+    st.caption("Tip: Keep each batch below about 180 MB. For 110 photos, plan on approximately 10 batches.")
 
-def read_image(upload):
-    """Read independently from an uploaded file's current pointer position."""
-    with Image.open(io.BytesIO(upload.getvalue())) as source:
-        return ImageOps.exif_transpose(source).convert("RGBA")
+with right:
+    st.subheader("Preview & Download")
+    if photos:
+        total_mb = sum(p.size for p in photos) / (1024 * 1024)
+        st.write(f"**Selected:** {len(photos)} photos · **Total:** {total_mb:.1f} MB")
+        if len(photos) > MAX_BATCH:
+            st.error(f"Please select no more than {MAX_BATCH} photos per batch.")
+        elif total_mb > MAX_TOTAL_MB:
+            st.error(f"This batch exceeds {MAX_TOTAL_MB} MB. Split it into smaller batches.")
+        elif not (portrait or landscape):
+            st.warning("Upload a portrait frame, a landscape frame, or both.")
+        else:
+            try:
+                preview, orientation = frame_image(photos[0], portrait, landscape, max_side=750)
+                st.image(preview, caption=f"First photo preview — {orientation}", width="stretch")
+                preview.close()
+            except Exception as exc:
+                st.warning(f"Preview unavailable: {type(exc).__name__}: {exc}")
 
-
-def apply_frame(photo_file, portrait_frame_file, landscape_frame_file, position):
-    photo = read_image(photo_file)
-    is_portrait = photo.height > photo.width
-    orientation = "Portrait" if is_portrait else "Landscape"
-    selected = (portrait_frame_file if is_portrait else landscape_frame_file)
-    if selected is None:
-        selected = landscape_frame_file if is_portrait else portrait_frame_file
-    if selected is None:
-        raise ValueError("Upload at least one PNG frame.")
-
-    frame = read_image(selected)
-    fitted = ImageOps.fit(photo, frame.size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-    if position == "Overlay (Frame on top)":
-        result = Image.alpha_composite(fitted, frame)
+            if st.button("⚙️ Process this batch", type="primary"):
+                clear_prior_export()
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(prefix="sme_export_", suffix=".zip", delete=False) as tmp:
+                        tmp_path = tmp.name
+                    progress = st.progress(0, text="Preparing images...")
+                    def report(done, count):
+                        progress.progress(done / count, text=f"Processed {done}/{count} photos")
+                    successes, errors = process_batch(
+                        photos, portrait, landscape, prefix, tmp_path, on_progress=report
+                    )
+                    if successes:
+                        st.session_state.export_path = tmp_path
+                        st.session_state.export_meta = (successes, errors, st.session_state.batch_num, safe_name(prefix))
+                        st.success(f"Created {successes} framed photos in batch {st.session_state.batch_num}.")
+                    else:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                        st.error("None of the photos could be processed. Check your frames and image formats.")
+                    if errors:
+                        with st.expander(f"{len(errors)} photo(s) skipped — details"):
+                            st.code("\n".join(errors))
+                except Exception as exc:
+                    if tmp_path and os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                    st.error(f"Processing failed: {type(exc).__name__}: {exc}")
     else:
-        result = Image.alpha_composite(frame, fitted)
-    return result, orientation
+        st.write("Upload your frames and photos to start.")
 
-
-def to_jpeg_bytes(canvas):
-    """Flatten any transparency before JPEG export."""
-    base = Image.new("RGB", canvas.size, (255, 255, 255))
-    base.paste(canvas, mask=canvas.getchannel("A"))
-    buffer = io.BytesIO()
-    base.save(buffer, format="JPEG", quality=95, optimize=True)
-    return buffer.getvalue()
-
-
-def safe_name(name):
-    result = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
-    return result or "SME_Event"
-
-
-def upload_signature(upload):
-    return (upload.name, upload.size, hashlib.sha256(upload.getvalue()).hexdigest()) if upload else None
-
-
-col1, col2 = st.columns([1, 2])
-with col1:
-    st.header("1. Upload & Settings")
-    portrait_frame_file = st.file_uploader("Upload Portrait Frame (PNG with transparency)", type=["png"], key="p_frame")
-    landscape_frame_file = st.file_uploader("Upload Landscape Frame (PNG with transparency)", type=["png"], key="l_frame")
-    photos_files = st.file_uploader("Upload Event Photos", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key="photos")
-    st.subheader("⚙️ Export Naming Settings")
-    naming_convention = st.radio("File Naming Style", ["Custom Prefix + Number (e.g., SME_Event_001.jpg)", "Keep Original Filename (e.g., framed_IMG_1024.jpg)"], index=0)
-    custom_prefix = ""
-    if "Custom Prefix" in naming_convention:
-        custom_prefix = st.text_input("Enter File Prefix / Event Name", value="SME_Event")
-    frame_position = st.radio("Frame Layer Position", ["Overlay (Frame on top)", "Underlay (Photo on top)"], index=0)
-
-with col2:
-    st.header("2. Preview & Export")
-    if (portrait_frame_file or landscape_frame_file) and photos_files:
-        try:
-            preview, orientation = apply_frame(photos_files[0], portrait_frame_file, landscape_frame_file, frame_position)
-            st.subheader("Sample Preview")
-            st.image(preview, caption=f"Previewing photo 1 of {len(photos_files)} (Detected: {orientation})", width="stretch")
-        except (OSError, ValueError, UnidentifiedImageError) as exc:
-            st.error(f"Unable to preview image: {exc}")
-            st.stop()
-
-        # A changed input invalidates the previous export, but ordinary button reruns do not.
-        signature = (
-            tuple(upload_signature(f) for f in photos_files),
-            upload_signature(portrait_frame_file),
-            upload_signature(landscape_frame_file),
-            naming_convention, custom_prefix, frame_position,
-        )
-        if st.session_state.get("export_signature") != signature:
-            st.session_state.pop("export_zip", None)
-            st.session_state["export_signature"] = signature
-
-        if st.button("🚀 Process All Photos (.ZIP)"):
-            zip_buffer = io.BytesIO()
-            progress = st.progress(0)
-            failures = []
-            successes = 0
-            used_names = set()
-            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for idx, photo in enumerate(photos_files, start=1):
-                    try:
-                        result, _ = apply_frame(photo, portrait_frame_file, landscape_frame_file, frame_position)
-                        if "Custom Prefix" in naming_convention:
-                            name = f"{safe_name(custom_prefix)}_{idx:03d}.jpg"
-                        else:
-                            stem = os.path.splitext(os.path.basename(photo.name))[0]
-                            name = f"framed_{safe_name(stem)}.jpg"
-                        if name in used_names:
-                            name = f"{os.path.splitext(name)[0]}_{idx:03d}.jpg"
-                        used_names.add(name)
-                        archive.writestr(name, to_jpeg_bytes(result))
-                        successes += 1
-                    except (OSError, ValueError, UnidentifiedImageError) as exc:
-                        failures.append(f"{photo.name}: {exc}")
-                    finally:
-                        progress.progress(idx / len(photos_files))
-            st.session_state["export_zip"] = zip_buffer.getvalue() if successes else None
-            if successes:
-                st.success(f"Processed {successes} of {len(photos_files)} photos!")
-            else:
-                st.error("No photos were processed successfully.")
-            if failures:
-                st.warning("Some images were skipped: " + "; ".join(failures[:5]))
-
-        if st.session_state.get("export_zip"):
-            st.download_button("📥 Download ZIP File", data=st.session_state["export_zip"], file_name=f"{safe_name(custom_prefix or 'SME_framed_photos')}.zip", mime="application/zip")
-    else:
-        st.info("Please upload your photos and at least one frame template to enable preview.")
+    saved = st.session_state.export_path
+    meta = st.session_state.export_meta
+    if saved and meta and os.path.exists(saved):
+        successes, errors, completed_batch, saved_prefix = meta
+        st.success(f"Batch {completed_batch} ready: {successes} image(s)")
+        # Streamlit may buffer download data in RAM. A 12-photo JPEG ZIP is deliberately small.
+        with open(saved, "rb") as zip_file:
+            st.download_button(
+                "📥 Download framed photos ZIP", zip_file,
+                file_name=f"{saved_prefix}_batch_{completed_batch:02d}.zip",
+                mime="application/zip", type="primary", on_click="ignore"
+            )
+        st.warning("Download the ZIP before clicking Next batch. The previous ZIP is deleted when you move on.")
+        if st.button("➡️ Next batch — upload more photos"):
+            clear_prior_export()
+            st.session_state.batch_num += 1
+            st.rerun()
